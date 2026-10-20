@@ -1,0 +1,112 @@
+name: ledgerly
+
+x-api-env: &api-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgresql://ledgerly:ledgerly@postgres:5432/ledgerly
+  REDIS_URL: redis://redis:6379
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC: ledger.events
+  API_KEYS: ${API_KEYS:-dev-ledger-key}
+  CORS_ORIGINS: http://localhost:8081,http://localhost:5173
+
+x-api-service: &api-service
+  build:
+    context: .
+    dockerfile: apps/api/Dockerfile
+  environment: *api-env
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    kafka: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ledgerly
+      POSTGRES_PASSWORD: ledgerly # local development only
+      POSTGRES_DB: ledgerly
+    ports: ['5434:5432']
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ledgerly']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ['6381:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ['29092:29092']
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1',
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  api:
+    <<: *api-service
+    command: ['node', 'dist/server.js']
+    ports: ['3001:3001']
+
+  relay:
+    <<: *api-service
+    command: ['node', 'dist/relay.js']
+    depends_on:
+      api: { condition: service_started }
+      kafka: { condition: service_healthy }
+
+  dispatcher:
+    <<: *api-service
+    command: ['node', 'dist/dispatcher.js']
+    depends_on:
+      api: { condition: service_started }
+      kafka: { condition: service_healthy }
+
+  webhook-sink:
+    <<: *api-service
+    command: ['node', 'dist/dev/webhook-sink.js']
+    environment:
+      SINK_PORT: 4000
+      SINK_FAILURE_RATE: ${SINK_FAILURE_RATE:-0.2}
+    ports: ['4000:4000']
+    depends_on: {}
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports: ['8081:80']
+    depends_on:
+      api: { condition: service_started }
+
+volumes:
+  postgres-data:
